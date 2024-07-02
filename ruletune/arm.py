@@ -3,6 +3,7 @@ import multiprocessing
 import psutil
 import time
 import sys
+import re
 
 import warnings
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -17,21 +18,41 @@ from mlxtend.frequent_patterns import apriori, fpmax, fpgrowth, hmine, associati
 
 
 class ARM:
-    def __init__(self) -> None:
-        pass
+    def __init__(self, df: pd.DataFrame, transaction_id_column: str, product_id_column) -> None:
+        """
+        Initialize the ARM (Association Rule Mining) class.
 
-    @staticmethod
-    def create_basket(df: pd.DataFrame, purchase_identifier_column: str, product_identifier_column: str):
-        df_source: pd.DataFrame = df.copy()
-        tickets = {ticket: i for i, ticket in enumerate(sorted(list(df_source[purchase_identifier_column].unique())))}
-        skus = {sku: i for i, sku in enumerate(sorted(list(df_source[product_identifier_column].unique())))}
+        Args:
+            df (pd.DataFrame): The input DataFrame containing transaction data.
+            transaction_id_column (str): The name of the column containing transaction IDs.
+            product_id_column (str): The name of the column containing product IDs.
+        """
+        self.df: pd.DataFrame = df
+        self.tid_column: str = transaction_id_column
+        self.pid_column: str = product_id_column
+        self.basket: pd.DataFrame = self.create_basket()
 
-        df_source["row"] = df_source[purchase_identifier_column].map(lambda x: tickets[x])
-        df_source["col"] = df_source[product_identifier_column].map(lambda x: skus[x])
-        df_source["data"] = np.ones((df_source.shape[0],), dtype=np.int8)
+    def create_basket(self) -> pd.DataFrame:
+        """
+        Create a basket format DataFrame from the transaction data.
+
+        This method transforms the transaction data into a sparse matrix where each row represents a transaction
+        and each column represents a product. The matrix is then converted into a DataFrame in basket format,
+        where the presence of a product in a transaction is indicated by a boolean value.
+
+        Returns:
+            pd.DataFrame: A DataFrame in basket format with transactions as rows and products as columns.
+        """
+
+        tickets = {ticket: i for i, ticket in enumerate(sorted(list(self.df[self.tid_column].unique())))}
+        skus = {sku: i for i, sku in enumerate(sorted(list(self.df[self.pid_column].unique())))}
+
+        self.df["row"] = self.df[self.tid_column].map(lambda x: tickets[x])
+        self.df["col"] = self.df[self.pid_column].map(lambda x: skus[x])
+        self.df["data"] = np.ones((self.df.shape[0],), dtype=np.int8)
 
         sparse_matrix = csr_matrix(
-            (df_source["data"], (df_source["row"], df_source["col"])),
+            (self.df["data"], (self.df["row"], self.df["col"])),
             shape=(len(tickets), len(skus)),
             dtype=np.int8
         )
@@ -43,20 +64,37 @@ class ARM:
             index=tickets,
             columns=skus,
         )
+
         return basket
     
-    @staticmethod
-    def save_basket(filename: str, basket: csr_matrix):
+    def save_basket(self, filename: str):
+        """
+        Save the basket DataFrame to a file in compressed NumPy .npz format.
+
+        Args:
+            filename (str): The name of the file to save the basket data.
+        """
+
         np.savez(
             filename,
-            data=basket.data,
-            indices=basket.indices,
-            indptr=basket.indptr,
-            shape=basket.shape
+            data=self.basket.data,
+            indices=self.basket.indices,
+            indptr=self.basket.indptr,
+            shape=self.basket.shape
         )
 
     @staticmethod
     def load_basket(filename):
+        """
+        Load a basket from a compressed NumPy .npz file.
+
+        Args:
+            filename (str): The name of the file to load the basket data from.
+
+        Returns:
+            csr_matrix: The basket data as a sparse CSR matrix.
+        """
+
         loader = np.load(filename)
         return csr_matrix(
             (loader['data'], loader['indices'], loader['indptr']),
@@ -65,6 +103,20 @@ class ARM:
     
     @staticmethod
     def algorithm_wrapper(queue: multiprocessing.Queue, algorithm: Callable, basket: pd.DataFrame, min_support: float = 0.1) -> pd.DataFrame:
+        """
+        Execute a given association rule mining algorithm on the basket data.
+
+        Args:
+            queue (multiprocessing.Queue): The multiprocessing queue to put the result into.
+            algorithm (Callable): The association rule mining algorithm to apply.
+            basket (pd.DataFrame): The basket data on which to run the algorithm.
+            min_support (float, optional): The minimum support threshold for the algorithm. Defaults to 0.1.
+
+        Returns:
+            pd.DataFrame: The resulting DataFrame containing the support and itemsets,
+                        or an empty DataFrame with columns ["support", "itemsets"] in case of errors.
+        """
+
         try:
             result = algorithm(basket, min_support=min_support, use_colnames=True)
         except ValueError as ve:
@@ -76,6 +128,22 @@ class ARM:
     
     @staticmethod
     def get_frequent_itemsets(algorithm: Callable, basket: pd.DataFrame, min_support: float = 0.1, etime: int = 3600) -> pd.DataFrame:
+        """
+        Execute a given association rule mining algorithm to find frequent itemsets from the basket data
+        within a specified time limit or memory threshold.
+
+        Args:
+            algorithm (Callable): The association rule mining algorithm to apply.
+            basket (pd.DataFrame): The basket data on which to run the algorithm.
+            min_support (float, optional): The minimum support threshold for the algorithm. Defaults to 0.1.
+            etime (int, optional): The maximum elapsed time (in seconds) before terminating the algorithm.
+                                Defaults to 3600 seconds (1 hour).
+
+        Returns:
+            pd.DataFrame: The DataFrame containing the frequent itemsets with columns ["support", "itemsets"],
+                        or None if no itemsets were found within the given constraints.
+        """
+            
         result_queue = multiprocessing.Queue()
         algorithm_process = multiprocessing.Process(target=ARM.algorithm_wrapper, args=(result_queue, algorithm, basket, min_support))
         algorithm_process.start()
@@ -98,6 +166,20 @@ class ARM:
 
     @staticmethod
     def generate_rules(frequent_itemsets: pd.DataFrame, metric: str = "lift", min_threshold: float = 0.001) -> pd.DataFrame:
+        """
+        Generate association rules from frequent itemsets using the specified metric and minimum threshold.
+
+        Args:
+            frequent_itemsets (pd.DataFrame): The DataFrame containing frequent itemsets with columns ["support", "itemsets"].
+            metric (str, optional): The metric to use for rule generation, e.g., "lift", "confidence". Defaults to "lift".
+            min_threshold (float, optional): The minimum threshold for the specified metric. Defaults to 0.001.
+
+        Returns:
+            pd.DataFrame: The DataFrame containing the generated association rules with columns:
+                        ["antecedents", "consequents", "antecedent support", "consequent support",
+                        "support", "confidence", "lift", "leverage", "conviction", "zhangs_metric"].
+                        Returns an empty DataFrame if no rules were generated.
+        """
 
         try:
             rules = association_rules(
@@ -134,6 +216,19 @@ class ARM:
     
     @staticmethod
     def describe_rules(rules: pd.DataFrame, df_sku: pd.DataFrame, sku_col: str, description_col: str) -> pd.DataFrame:
+        """
+        Convert SKU identifiers in association rules to their corresponding descriptions.
+
+        Args:
+            rules (pd.DataFrame): DataFrame containing association rules with columns ["antecedents", "consequents"].
+            df_sku (pd.DataFrame): DataFrame mapping SKU identifiers to descriptions with columns [sku_col, description_col].
+            sku_col (str): Name of the column in df_sku containing SKU identifiers.
+            description_col (str): Name of the column in df_sku containing SKU descriptions.
+
+        Returns:
+            pd.DataFrame: DataFrame with association rules where SKU identifiers in "antecedents" and "consequents"
+                        columns are replaced with their corresponding descriptions from df_sku.
+        """
         def sku_to_description(x: frozenset, df_sku: pd.DataFrame, description_col: str) -> frozenset:
             result = []
             for element in x:
@@ -149,6 +244,16 @@ class ARM:
     
     @staticmethod
     def get_min_support_values(a: int = -3, b: int = 0):
+        """
+        Generate an array of minimum support values for association rule mining.
+
+        Args:
+            a (int, optional): Exponent of the lower bound of minimum support values (10**a). Defaults to -3.
+            b (int, optional): Exponent of the upper bound of minimum support values (10**b). Defaults to 0.
+
+        Returns:
+            np.ndarray: Array of minimum support values logarithmically spaced between 10**a and 10**b.
+        """
 
         arrays = []
 
@@ -157,12 +262,38 @@ class ARM:
 
         return np.concatenate(arrays)
 
-    @staticmethod
     def search_rules(
-        basket: pd.DataFrame, algorithms: List[Callable] = [apriori, fpgrowth, fpmax, hmine],
+        self, algorithms: List[Callable] = [apriori, fpgrowth, fpmax, hmine],
         etime: int = 3600, df_sku: pd.DataFrame = None, sku_col: str = None, description_col: str = None,
-        save_directory: str = "./"
-    ):
+        save_directory: str = None
+    ) -> pd.DataFrame:
+        """
+        Search for association rules using multiple algorithms and different minimum support values.
+
+        This method iterates over a list of association rule mining algorithms and searches for frequent itemsets
+        using a range of minimum support values. For each algorithm and minimum support value combination,
+        it generates association rules and collects summary statistics.
+
+        Args:
+            algorithms (List[Callable], optional): List of association rule mining algorithms to use.
+                                                Defaults to [apriori, fpgrowth, fpmax, hmine].
+            etime (int, optional): Maximum elapsed time (in seconds) before terminating each algorithm.
+                                Defaults to 3600 seconds (1 hour).
+            df_sku (pd.DataFrame, optional): DataFrame mapping SKU identifiers to descriptions.
+                                            Used for describing rules if provided. Defaults to None.
+            sku_col (str, optional): Name of the column in df_sku containing SKU identifiers.
+                                    Required if df_sku is provided. Defaults to None.
+            description_col (str, optional): Name of the column in df_sku containing SKU descriptions.
+                                            Required if df_sku is provided. Defaults to None.
+            save_directory (str, optional): Directory path to save intermediate and final results (CSV files).
+                                            Defaults to None.
+
+        Returns:
+            pd.DataFrame: DataFrame summarizing the results of the association rule mining search with columns:
+                        ["algorithm", "min_support", "num_freq_itemsets", "num_rules", "max_confidence", "notes"].
+                        Each row corresponds to the results for a specific algorithm and minimum support value combination.
+        """
+
         # dictionary that holds data for the final dataframe summary
         results: Dict = {
             "algorithm": [],
@@ -188,7 +319,7 @@ class ARM:
 
                 frequent_itemsets = ARM.get_frequent_itemsets(
                     algorithm=algorithm,
-                    basket=basket,
+                    basket=self.basket,
                     min_support=min_support,
                     etime=etime
                 )
@@ -225,16 +356,17 @@ class ARM:
                     max_confidence = None
                     num_rules = 0
                     note = "No rules could be found in itemsets."
+                
+                if save_directory:
+                    frequent_itemsets.to_csv(
+                        f"{save_directory}/fqits_{algorithm.__name__}_{min_support}.csv",
+                        index=False
+                    )
 
-                frequent_itemsets.to_csv(
-                    f"{save_directory}/fqits_{algorithm.__name__}_{min_support}.csv",
-                    index=False
-                )
-
-                rules.to_csv(
-                    f"{save_directory}/rules_{algorithm.__name__}_{min_support}.csv",
-                    index=False
-                )
+                    rules.to_csv(
+                        f"{save_directory}/rules_{algorithm.__name__}_{min_support}.csv",
+                        index=False
+                    )
 
             elif frequent_itemsets.shape[0] == 0:
                 num_freq_itemsets = 0
@@ -252,8 +384,47 @@ class ARM:
             print("")
 
         df_summary: pd.DataFrame = pd.DataFrame(results)
-        df_summary.to_csv(
-            f"{save_directory}/summary.csv",
-            index=False
-        )
+
+        if save_directory:
+            df_summary.to_csv(
+                f"{save_directory}/summary.csv",
+                index=False
+            )
+
         return df_summary
+    
+
+def read_dat(path: str, sep: str = ' ') -> pd.DataFrame:
+    with open(path, "r") as f:
+        lines = f.readlines()
+    
+    data = {
+        "tid": [],
+        "item": []
+    }
+    num_lines = len(lines)
+    zeros_len = len(str(num_lines))
+
+    for i, line in enumerate(lines):
+        tid = str(i).zfill(zeros_len)
+        for item in line.split(sep):
+            if re.search(r"\d+", item):
+                data["tid"].append(tid)
+                data["item"].append(item)
+
+    return pd.DataFrame(data)
+
+
+if __name__ == "__main__":
+
+    df = read_dat("./examples/brijs/retail.dat")
+    print(df)
+
+    arm = ARM(
+        df=df,
+        transaction_id_column="tid",
+        product_id_column="item"
+    )
+
+    df_summary = arm.search_rules()
+    print(df_summary)
